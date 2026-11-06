@@ -1,32 +1,14 @@
-# Compiled CUDA / C++ binaries
-*.x
-*.o
-*.obj
-
-# Python
+/prc
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.egg-info/
+*.py[cod]
 .venv/
-venv/
-
-# Run outputs / large data
-run_*/
+*.o
+*.x
 *.raw
-example_data/**/*.raw
-ACTIVITY_PRC*.raw
-ACTIVITY_PRC_RL_HETERO*.raw
-
-# Editor / OS
-.DS_Store
-.vscode/
-.idea/
-*.swp
-
-# Local archives
+*.nii
+*.nii.gz
+*.h5
+*.dcm
 *.zip
-*.tar
-*.tar.gz
+*.tar*
+/results/
