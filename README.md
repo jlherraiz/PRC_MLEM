@@ -35,7 +35,7 @@ Supported isotopes: `11C`, `13N`, `15O`, `18F`, `64Cu`, `68Ga`, `82Rb`, `124I`.
 | `--no-accel` | off | Disable extrapolation |
 | `--mode` | `correct` | Also supports `forward` and `adjoint` |
 
-Run `./prc` to list all options. Use `--beta 0 --no-accel` for plain
+Run `./prc --help` to list all options. Use `--beta 0 --no-accel` for plain
 Richardson–Lucy. `--save-every K` saves intermediate estimates;
 `--reproject` also writes the corrected image passed through the blur model.
 

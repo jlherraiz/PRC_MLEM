@@ -3,7 +3,7 @@
 // Richardson-Lucy with an RDP prior and optional Biggs-Andrews acceleration.
 // Prior/accelerated updates are empirical; no global convergence guarantee.
 // Full-data iterations, without ordered subsets.
-// Build: bash build.sh. Run ./prc without arguments for usage.
+// Build: bash build.sh. Run ./prc --help for usage.
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -31,7 +31,7 @@
         }                                                                                      \
     } while (0)
 
-// ------------------------------------------------------------------------------------ isotopes
+// Isotope range model
 // Survival S(r) = sum_b w_b exp(-p_b(r)), p_b(r) = (a r)^(1+f) + (b r)^2.5 + (c r)^3.5: the fraction of
 // positrons that travel farther than the water-equivalent distance r [mm] (Paneque-Yunta et al.,
 // Phys. Med. Biol. 70 (2025) 165013, Tables 4 and 5).
@@ -90,7 +90,7 @@ static float range_cutoff(const Isotope& iso, float fraction) {
     return hi;
 }
 
-// ------------------------------------------------------------------------------------ geometry
+// Geometry and ray traversal
 struct Grid {
     int nx, ny, nz;
     float sx, sy, sz;   // voxel size [mm]
@@ -112,10 +112,9 @@ __device__ inline bool inside(const Grid& g, int i, int j, int k) {
     return i >= 0 && i < g.nx && j >= 0 && j < g.ny && k >= 0 && k < g.nz;
 }
 
-// Ray k of n. Rays 2m and 2m+1 start at +/- the m-th point of the R3 low-discrepancy sequence inside
-// the source voxel (in voxels from its centre) and leave along +/- the m-th point of a Fibonacci lattice
-// on the upper hemisphere. The mirrored pairs keep the kernel of a uniform medium centred on its source.
-// Unsigned products wrap modulo 2^32, which gives the fractional parts of m * constant exactly.
+// Mirrored pairs use R3 source offsets and Fibonacci hemisphere directions.
+// Offsets are in voxels from the source centre; mirroring centres the uniform kernel.
+// Unsigned products wrap modulo 2^32.
 __device__ inline void ray(int k, int n, float3* start, float3* dir) {
     const unsigned m = k >> 1;
     const float sign = (k & 1) ? -1.0f : 1.0f, z = 1.0f - (m + 0.5f) / ((n + 1) >> 1);
@@ -129,12 +128,9 @@ __device__ inline void ray(int k, int n, float3* start, float3* dir) {
                          sign * (to_unit * (0x80000000u + m * 2360945575u) - 0.5f));
 }
 
-// Walks the ray from v + x (x in voxels from the centre of source voxel v) along the unit vector d,
-// voxel by voxel (Amanatides-Woo). In each crossed voxel the water-equivalent path grows by rho times
-// the length, and the positron annihilates there with probability S(w_in) - S(w_out).
-// visit(i, j, k, p) receives the tissue voxels inside the near block (near = true; the walk ends at the
-// block edge) or outside it (near = false). The walk also ends at the cutoff, at the volume edge or after
-// air_cap mm of consecutive air.
+// Trace from v+x (x in voxel units) along unit direction d, stepping voxel faces.
+// Visit tissue deposits S(w_in)-S(w_out) inside the near block, or outside it for far rays.
+// Stop at range/image/air limits; near traces also stop at their block edge.
 template <class Visit>
 __device__ void trace_ray(cudaTextureObject_t tex, const Grid& g, int3 v, float3 x, float3 d, bool near,
                           Visit&& visit) {
@@ -168,18 +164,12 @@ __device__ void trace_ray(cudaTextureObject_t tex, const Grid& g, int3 v, float3
     }
 }
 
-// ----------------------------------------------------------------------------- projector kernel
-// One warp per tissue source voxel. The warp visits every (target t, weight w_st) of the source's
-// kernel and hands them to Op:
-//   NormOp    W_s = sum_t w_st
-//   ForwardOp out_t += f_s w_st / W_s          (scatter with atomics)
-//   AdjointOp out_s  = sum_t w_st in_t / W_s   (gather)
-// The lanes split the near-block rays, adding their deposits per block voxel in shared memory (or read
-// these weights from the cache), and then split the far-field rays.
+// Projector: one warp per source. Near weights use shared memory or cache; far rays are traced.
+// NormOp sums w_st. ForwardOp scatters f_s*w_st/W_s; AdjointOp gathers w_st*in_t/W_s.
 struct ProjectorArgs {
     cudaTextureObject_t tex;
     Grid g;
-    const int* active;  // tissue voxel indices
+    int* active;        // owned by Projector, read-only in kernels
     int n_active;
     int n_rays;         // far-field rays
     float* near_cache;  // optional: kNear block weights per active source
@@ -276,18 +266,16 @@ struct AdjointOp {
     __device__ void end(int src, int s, float acc) { out[s] = acc / W[src]; }
 };
 
-// ------------------------------------------------------------------------------- image kernels
+// Image updates
 __global__ void ratio_kernel(const float* g, const float* est, const unsigned char* support, float* ratio,
                              size_t n, float eps) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) ratio[i] = support[i] ? g[i] / fmaxf(est[i], eps) : 0.0f;
 }
 
-// Relative-difference prior on the 26 tissue neighbours. Distance weights use physical
-// spacing, normalized by the smallest spacing (unchanged for isotropic voxels).
-// Evaluate the gradient and a diagonal curvature at f, then solve the positive scalar
-// quadratic update. Read f and write next separately: neighbours must see the same iterate.
-// This is an empirically stable, count-rescaled MAP-EM update, not a global convergence proof.
+// RDP over 26 tissue neighbours, with distance weights normalized by minimum spacing.
+// Read f and write next separately so all gradients use the same iterate.
+// Diagonal curvature and count rescaling are empirical, without a convergence guarantee.
 __global__ void update_kernel(const float* f, const float* back, const unsigned char* support,
                               float* next, Grid g, float beta, float gamma, float eps) {
     const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -343,7 +331,7 @@ __global__ void finish_kernel(float* next, float* residual, float scale, size_t 
     }
 }
 
-// ------------------------------------------------------------------------------------ host side
+// Host utilities
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -358,13 +346,14 @@ static void read_raw(const std::string& path, std::vector<float>* v) {
     fclose(fp);
 }
 
-static void write_raw(const std::string& path, const std::vector<float>& v) {
-    for (float value : v) if (!std::isfinite(value)) {
+static void save_image(const std::string& path, const float* device, std::vector<float>& host) {
+    CUDA_CHECK(cudaMemcpy(host.data(), device, host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (float value : host) if (!std::isfinite(value)) {
         fprintf(stderr, "Non-finite output: %s\n", path.c_str());
         exit(EXIT_FAILURE);
     }
     FILE* fp = fopen(path.c_str(), "wb");
-    if (!fp || fwrite(v.data(), sizeof(float), v.size(), fp) != v.size() || fclose(fp) != 0) {
+    if (!fp || fwrite(host.data(), sizeof(float), host.size(), fp) != host.size() || fclose(fp) != 0) {
         fprintf(stderr, "Cannot write %s\n", path.c_str());
         exit(EXIT_FAILURE);
     }
@@ -415,32 +404,32 @@ class Projector {
   public:
     Projector(const Grid& g, cudaTextureObject_t tex, const std::vector<int>& active, int n_rays,
               bool cache_near = false)
-        : g_(g), tex_(tex), n_active_((int)active.size()), n_rays_(n_rays) {
-        d_active_ = device_alloc<int>(n_active_);
-        CUDA_CHECK(cudaMemcpy(d_active_, active.data(), n_active_ * sizeof(int), cudaMemcpyHostToDevice));
-        d_W_ = device_alloc<float>(n_active_);
-        // The near-block weights (kNear per source) are cached if they fit in a quarter of the free
-        // memory; otherwise every pass traces them again.
+        : args_{tex, g, nullptr, (int)active.size(), n_rays, nullptr} {
+        args_.active = device_alloc<int>(args_.n_active);
+        CUDA_CHECK(cudaMemcpy(args_.active, active.data(), args_.n_active * sizeof(int), cudaMemcpyHostToDevice));
+        d_W_ = device_alloc<float>(args_.n_active);
+        // Cache near weights if they fit in a quarter of free memory; otherwise retrace them.
         size_t free_bytes, total_bytes;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-        const size_t bytes = (size_t)n_active_ * kNear * sizeof(float);
-        if (cache_near && bytes <= free_bytes / 4 && cudaMalloc(&d_near_, bytes) != cudaSuccess) {
-            d_near_ = nullptr;
+        const size_t bytes = (size_t)args_.n_active * kNear * sizeof(float);
+        if (cache_near && bytes <= free_bytes / 4 && cudaMalloc(&args_.near_cache, bytes) != cudaSuccess) {
+            args_.near_cache = nullptr;
             cudaGetLastError();  // optional cache: allocation failure falls back to recomputation
         }
-        printf("near-field cache: %s (%.0f MiB)\n", d_near_ ? "on" : "off", bytes / 1048576.0);
+        printf("near-field cache: %s (%.0f MiB)\n", args_.near_cache ? "on" : "off", bytes / 1048576.0);
         launch<true>(NormOp{d_W_});
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     ~Projector() {
-        cudaFree(d_active_);
+        cudaFree(args_.active);
         cudaFree(d_W_);
-        cudaFree(d_near_);
+        cudaFree(args_.near_cache);
     }
 
     // out = A f (out is overwritten)
     void forward(const float* f, float* out) const {
-        CUDA_CHECK(cudaMemset(out, 0, (size_t)g_.nx * g_.ny * g_.nz * sizeof(float)));
+        const Grid& g = args_.g;
+        CUDA_CHECK(cudaMemset(out, 0, (size_t)g.nx * g.ny * g.nz * sizeof(float)));
         launch(ForwardOp{f, d_W_, out, 0.0f});
     }
     // out = A^T in on tissue voxels (other voxels are left untouched)
@@ -449,21 +438,15 @@ class Projector {
   private:
     template <bool BuildCache = false, class Op>
     void launch(Op op) const {
-        const ProjectorArgs a{tex_, g_, d_active_, n_active_, n_rays_, d_near_};
         const int warps = kThreads / 32;
-        // Shared memory only while tracing the near block: reserving it always would shrink the L1
-        // cache that the far-field rays rely on (~10% slower passes).
-        const size_t smem = BuildCache || !d_near_ ? warps * kNear * sizeof(float) : 0;
-        project_kernel<Op, BuildCache><<<((size_t)n_active_ + warps - 1) / warps, kThreads, smem>>>(a, op);
+        // Reserve shared memory only when tracing near weights, preserving L1 capacity.
+        const size_t smem = BuildCache || !args_.near_cache ? warps * kNear * sizeof(float) : 0;
+        project_kernel<Op, BuildCache><<<((size_t)args_.n_active + warps - 1) / warps, kThreads, smem>>>(args_, op);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    Grid g_;
-    cudaTextureObject_t tex_;
-    int n_active_, n_rays_;
-    int* d_active_ = nullptr;
+    ProjectorArgs args_;
     float* d_W_ = nullptr;
-    float* d_near_ = nullptr;
 };
 
 struct Options {
@@ -475,8 +458,8 @@ struct Options {
     bool reproject = false, cache_near = true, exact_range = false, accelerate = true;
 };
 
-static void print_usage(const char* prog) {
-    fprintf(stderr,
+static void print_usage(const char* prog, FILE* stream = stderr) {
+    fprintf(stream,
             "Usage: %s ISOTOPE NX NY NZ DX DY DZ [options]\n"
             "  --mode correct|forward|adjoint   (default correct)\n"
             "  --input FILE      blurred (correct) or source (forward/adjoint) image, default ACTIVITY.raw\n"
@@ -496,8 +479,8 @@ static void print_usage(const char* prog) {
             "  --no-accel        plain MAP-EM without Biggs-Andrews extrapolation (validation)\n"
             "Isotopes:",
             prog);
-    for (const Isotope& iso : kIsotopes) fprintf(stderr, " %s", iso.name);
-    fprintf(stderr, "\n");
+    for (const Isotope& iso : kIsotopes) fprintf(stream, " %s", iso.name);
+    fprintf(stream, "\n");
 }
 
 static int parse_int(const char* text, const char* name) {
@@ -579,6 +562,10 @@ static std::string with_suffix(const std::string& path, const std::string& suffi
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        print_usage(argv[0], stdout);
+        return EXIT_SUCCESS;
+    }
     const Options o = parse(argc, argv);
     const Isotope* iso = nullptr;
     for (const Isotope& it : kIsotopes)
@@ -664,15 +651,12 @@ int main(int argc, char** argv) {
         else A.adjoint(d_g, d_out);
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("%s: %.3f s\n", o.mode.c_str(), now_s() - t);
-        CUDA_CHECK(cudaMemcpy(out.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
-        write_raw(o.output, out);
+        save_image(o.output, d_out, out);
         printf("sum in %.6g, sum out %.6g, total %.2f s\n", support_sum, device_sum(d_out, n), now_s() - t0);
         return EXIT_SUCCESS;
     }
 
-    // ---- MAP-EM (Richardson-Lucy + relative-difference prior), initialised with the blurred image and
-    // accelerated by Biggs-Andrews extrapolation: each step starts from y = f + lambda (f - prev), where
-    // lambda is the correlation of the last two steps h = (new estimate - y), clipped to [0, 1].
+    // MAP-EM with optional extrapolation; history buffers are reused as scratch.
     printf("MAP-EM: %d iterations, beta %.4g, gamma %.3g\n", o.iterations, o.beta, o.gamma);
     float* d_f = device_alloc<float>(n);       // estimate
     float* d_prev = d_out;  // previous estimate during prediction, then adjoint scratch
@@ -719,20 +703,17 @@ int main(int argc, char** argv) {
             printf("iteration %d/%d: %.2f s\n", it, o.iterations, now_s() - t);
         }
         if (o.save_every > 0 && it % o.save_every == 0 && it < o.iterations) {
-            CUDA_CHECK(cudaMemcpy(out.data(), d_f, n * sizeof(float), cudaMemcpyDeviceToHost));
             char tag[32];
             snprintf(tag, sizeof(tag), "_it%03d", it);
-            write_raw(with_suffix(o.output, tag), out);
+            save_image(with_suffix(o.output, tag), d_f, out);
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     const double t_iter = now_s() - t;
-    CUDA_CHECK(cudaMemcpy(out.data(), d_f, n * sizeof(float), cudaMemcpyDeviceToHost));
-    write_raw(o.output, out);
+    save_image(o.output, d_f, out);
     if (o.reproject) {
         A.forward(d_f, d_est);
-        CUDA_CHECK(cudaMemcpy(out.data(), d_est, n * sizeof(float), cudaMemcpyDeviceToHost));
-        write_raw(with_suffix(o.output, "_REPROJ"), out);
+        save_image(with_suffix(o.output, "_REPROJ"), d_est, out);
     }
     printf("sum blurred (tissue) %.6g, sum corrected %.6g\n", support_sum, device_sum(d_f, n));
     printf("iterations %.2f s (%.2f s each), total %.2f s\n", t_iter, o.iterations ? t_iter / o.iterations : 0.0,

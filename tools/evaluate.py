@@ -90,13 +90,11 @@ class Evaluator:
             "ssim_window": "3D Gaussian sigma 1.5, 11 voxels",
         }
 
-        zz, yy, xx = np.where(ndi.binary_dilation(body, iterations=4))
-        self.roi = (slice(zz.min(), zz.max() + 1), slice(yy.min(), yy.max() + 1), slice(xx.min(), xx.max() + 1))
+        self.roi = ndi.find_objects(ndi.binary_dilation(body, iterations=4), max_label=1)[0]
 
         # Relative tolerance preserves region membership when activity units change.
         is_background = (np.abs(self.t - self.bg) < 1e-6 * self.bg) & body
-        not_bg = ~is_background
-        self.bg_interior = ~ndi.binary_dilation(not_bg, structure=np.ones((3, 3, 3)), iterations=4, border_value=1)
+        self.bg_interior = ndi.binary_erosion(is_background, structure=np.ones((3, 3, 3)), iterations=4)
 
         lo = ndi.minimum_filter(truth, size=5, mode="nearest")
         hi = ndi.maximum_filter(truth, size=5, mode="nearest")

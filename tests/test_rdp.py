@@ -1,15 +1,27 @@
 """Independent CPU checks of the solver's mathematical formulas.
 
-These tests validate the scalar RDP derivatives and update, not CUDA execution.
+These tests validate the range table and scalar RDP formulas, not CUDA execution.
 In particular, they do not assert monotonicity of the full count-rescaled solver.
 Run with: python -m unittest discover -s tests -p test_rdp.py
 """
 
 import math
+from pathlib import Path
 import unittest
 
 import numpy as np
 from scipy.optimize import minimize_scalar
+
+from reference import range_table_error, read_model
+
+
+class RangeTableTests(unittest.TestCase):
+    def test_dense_survival_table_error_all_isotopes(self):
+        _, isotopes, bins = read_model(Path(__file__).resolve().parents[1] / "prc.cu")
+        self.assertEqual(set(isotopes), {"11C", "13N", "15O", "18F", "64Cu", "68Ga", "82Rb", "124I"})
+        for name, branches in isotopes.items():
+            with self.subTest(isotope=name):
+                self.assertLessEqual(range_table_error(branches, bins), 2e-5)
 
 
 def penalty(x, y, gamma, epsilon=0.0):
